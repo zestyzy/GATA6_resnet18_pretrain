@@ -1,0 +1,7 @@
+data/
+pretrain/
+__MACOSX/
+.DS_Store
+__pycache__/
+*.pyc
+*.pth
