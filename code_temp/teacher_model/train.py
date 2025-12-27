@@ -498,7 +498,7 @@ def train_teacher(
         pin_memory=pin_mem, 
         collate_fn=collate_fn,
         worker_init_fn=_seed_worker if workers > 0 else None, 
-        drop_last=False, 
+        drop_last=True, 
         persistent_workers=(workers > 0)
     )
     val_loader = DataLoader(
@@ -739,13 +739,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--max-grad-norm', type=float, default=0.0)
     parser.add_argument('--save-every', type=int, default=5)
-    parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--use-light-aug', action='store_true', default=False)
     parser.add_argument('--use-pos-weight', action='store_true', default=False)
 
     parser.add_argument('--arch', type=str, default='resnet50', choices=['resnet18','resnet34','resnet50'])
     parser.add_argument('--in-channels', type=int, default=2)
-    parser.add_argument('--norm', type=str, default='gn', choices=['bn','gn','in'])
+    parser.add_argument('--norm', type=str, default='bn', choices=['bn','gn','in'])
     parser.add_argument('--gn-groups', type=int, default=32)
     parser.add_argument('--downsample-depth-l4', action='store_true', default=False)
 
