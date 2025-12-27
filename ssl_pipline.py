@@ -480,7 +480,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=2025)
-    ap.add_argument("--teacher-val-split", type=float, default=0.2)
+    ap.add_argument("--teacher-val-split", type=float, default=0.1)
     
     # [新增] 预训练权重路径参数
     ap.add_argument("--pretrain-path", type=str, default=None, 
