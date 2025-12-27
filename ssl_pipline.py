@@ -87,7 +87,7 @@ def split_136(labeled_csv: Path, seed: int, outdir: Path) -> Tuple[Path, Path]:
     total_samples = len(df)
     if total_samples > 50:
         # 正常模式：严格按照 41 例做内部测试集
-        t_size = 41
+        t_size = 36
         print(f"[SPLIT] 标准模式: 总数 {total_samples} -> 拆分 {total_samples-41}/{41}")
     else:
         # Debug 模式：数据太少，切不出 41 例，改用 30% 比例
@@ -134,9 +134,9 @@ def train_teacher(
         
         # [关键修改] 切换为 ResNet18 + 适合微调的低学习率
         "--arch", "resnet18",
-        "--lr", "0.00005", # 5e-5，预训练微调推荐值 (若无预训练，train.py 会自动 fallback 到 1e-5 或 train.py 默认值)
+        "--lr", "0.0001", # 5e-5，预训练微调推荐值 (若无预训练，train.py 会自动 fallback 到 1e-5 或 train.py 默认值)
         "--in-channels", "2",
-        "--norm", "gn", "--gn-groups", "32",
+        "--norm", "bn",
         
         # [关键修改] 空间参数适配新 train.py
         "--crop-mode", "bbox",         
@@ -480,7 +480,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=2025)
-    ap.add_argument("--teacher-val-split", type=float, default=0.1)
+    ap.add_argument("--teacher-val-split", type=float, default=0.2)
     
     # [新增] 预训练权重路径参数
     ap.add_argument("--pretrain-path", type=str, default=None, 
