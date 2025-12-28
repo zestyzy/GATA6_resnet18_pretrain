@@ -5,6 +5,8 @@ import argparse
 import os
 import random
 import math
+import sys
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Tuple, List, Dict, Any, Sequence
 
@@ -19,6 +21,8 @@ from sklearn.metrics import (
     f1_score, matthews_corrcoef, balanced_accuracy_score
 )
 from sklearn.exceptions import UndefinedMetricWarning
+from sklearn.manifold import TSNE  # [New] For visualization
+from sklearn.decomposition import PCA # [New] Optional backup
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 import matplotlib
@@ -32,8 +36,64 @@ from .dataset import NiftiDataset, LightAugment3D, ChannelNormalize, Compose3D
 from .resnet3d import (
     generate_resnet18, generate_resnet34, generate_resnet50,
     bn_factory, gn_factory, in_factory,
-    load_medicalnet_weights, load_pretrained_2d_weights_to_3d # <--- Imported new functions
+    load_medicalnet_weights, load_pretrained_2d_weights_to_3d
 )
+
+# =============================================================================
+# [NEW] Tee logger: duplicate stdout/stderr to file (per-repeat train.log)
+# =============================================================================
+class _TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+            except Exception:
+                # Don't break training if a stream fails
+                pass
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        # Helps tqdm detect terminal capability
+        try:
+            return any(getattr(s, "isatty", lambda: False)() for s in self.streams)
+        except Exception:
+            return False
+
+@contextmanager
+def tee_stdout_stderr(log_path: str, mode: str = "w", encoding: str = "utf-8"):
+    """
+    Context manager that tees BOTH stdout and stderr to a log file,
+    while still keeping original console output.
+    This captures tqdm (stderr) + print (stdout).
+    """
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    orig_out, orig_err = sys.stdout, sys.stderr
+    f = open(log_path, mode=mode, encoding=encoding, buffering=1)  # line-buffered
+    try:
+        sys.stdout = _TeeStream(orig_out, f)
+        sys.stderr = _TeeStream(orig_err, f)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        sys.stdout, sys.stderr = orig_out, orig_err
+        try:
+            f.flush()
+        except Exception:
+            pass
+        f.close()
 
 # ----------------------- Subset with on-the-fly transform -----------------------
 class SubsetWithTransform(Dataset):
@@ -158,6 +218,112 @@ def _pos_logit(outputs: torch.Tensor, num_classes: int) -> torch.Tensor:
             raise ValueError(f"Unexpected output shape {tuple(outputs.shape)} for num_classes=1")
     return outputs[:, 1]
 
+# ----------------------- [New] Visualization Logic -----------------------
+class FeatureExtractorHook:
+    """
+    Hook to capture features from the layer before the final FC.
+    Assuming ResNet structure: ... -> avgpool -> fc
+    """
+    def __init__(self):
+        self.features = []
+
+    def hook_fn(self, module, input, output):
+        # output is usually (B, C, 1, 1, 1) or (B, C) depending on avgpool implementation
+        # We flatten it to (B, C)
+        self.features.append(output.flatten(start_dim=1).detach().cpu())
+
+    def clear(self):
+        self.features = []
+
+    def get_features(self):
+        if not self.features:
+            return None
+        return torch.cat(self.features, dim=0).numpy()
+
+def visualize_features(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    outdir: str,
+    epoch: int,
+    tag: str = "val"
+):
+    """
+    Extracts features, runs t-SNE, plots scatter plot.
+    """
+    model.eval()
+
+    # Register Hook on avgpool
+    # Adjust this if your ResNet definition names avgpool differently
+    if hasattr(model, 'avgpool'):
+        target_layer = model.avgpool
+    elif hasattr(model, 'module') and hasattr(model.module, 'avgpool'): # For DataParallel
+        target_layer = model.module.avgpool
+    else:
+        print("[Vis] Warning: Could not find 'avgpool' layer. Visualization skipped.")
+        return
+
+    hook = FeatureExtractorHook()
+    handle = target_layer.register_forward_hook(hook.hook_fn)
+
+    all_labels = []
+
+    try:
+        with torch.no_grad():
+            for volumes, labels in tqdm(dataloader, desc=f"Vis-{tag}", leave=False):
+                volumes = volumes.to(device)
+                _ = model(volumes) # Forward pass triggers hook
+                all_labels.extend(labels.numpy())
+
+        feats = hook.get_features()
+        labels_np = np.array(all_labels)
+
+        if feats is None or len(feats) == 0:
+            print("[Vis] No features captured.")
+            return
+
+        # t-SNE Calculation
+        # Perplexity must be < n_samples. Default 30.
+        n_samples = feats.shape[0]
+        perp = min(30, max(5, n_samples // 3)) # auto-adjust perplexity for small val sets
+
+        print(f"[Vis] Computing t-SNE on {n_samples} samples (dim={feats.shape[1]})...")
+        tsne = TSNE(n_components=2, perplexity=perp, random_state=42, init='pca', learning_rate='auto')
+        feats_embedded = tsne.fit_transform(feats)
+
+        # Plotting
+        plt.figure(figsize=(8, 6))
+
+        # Color map: 0=Blue, 1=Red
+        colors = ['blue' if l == 0 else 'red' for l in labels_np]
+
+        plt.scatter(feats_embedded[:, 0], feats_embedded[:, 1], c=colors, alpha=0.6, edgecolors='k', s=60)
+
+        # Create legend manually
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='w', label='Class 0 (Neg)', markerfacecolor='blue', markersize=10),
+            Line2D([0], [0], marker='o', color='w', label='Class 1 (Pos)', markerfacecolor='red', markersize=10)
+        ]
+        plt.legend(handles=legend_elements, loc="upper right")
+
+        plt.title(f"t-SNE of Features (Epoch {epoch}) [{tag}]")
+        plt.xlabel("Dim 1")
+        plt.ylabel("Dim 2")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        vis_path = os.path.join(outdir, f"tsne_{tag}_ep{epoch:03d}.png")
+        plt.savefig(vis_path, dpi=150)
+        plt.close()
+        print(f"[Vis] Saved t-SNE plot to {vis_path}")
+
+    except Exception as e:
+        print(f"[Vis] Error during visualization: {e}")
+    finally:
+        handle.remove() # Clean up hook
+        hook.clear()
+
 # ----------------------- [New] Diagnostics -----------------------
 def debug_visualize_batch(volumes: torch.Tensor, labels: torch.Tensor, outdir: str, epoch: int, stage: str = "train"):
     """
@@ -166,35 +332,35 @@ def debug_visualize_batch(volumes: torch.Tensor, labels: torch.Tensor, outdir: s
     vis_dir = os.path.join(outdir, "debug_vis")
     os.makedirs(vis_dir, exist_ok=True)
     batch_size = volumes.shape[0]
-    
+
     # Check first 2 samples
     for i in range(min(2, batch_size)):
         vol = volumes[i].detach().cpu().numpy()  # (C, D, H, W)
         label = labels[i].item()
-        
+
         # Middle slice
         mid_z = vol.shape[1] // 2
-        
+
         # Image Channel
         img_slice = vol[0, mid_z]
-        
+
         n_channels = vol.shape[0]
         fig, ax = plt.subplots(1, n_channels, figsize=(5 * n_channels, 5))
         if n_channels == 1:
             ax = [ax]
-            
+
         # Draw CT
         im0 = ax[0].imshow(img_slice, cmap='gray', origin='lower')
         ax[0].set_title(f"Ep{epoch} | BatchSample {i} | Lbl {label}\nCT (z={mid_z}) Range:[{img_slice.min():.1f}, {img_slice.max():.1f}]")
         plt.colorbar(im0, ax=ax[0])
-        
+
         # Draw Mask (if exists)
         if n_channels > 1:
             msk_slice = vol[1, mid_z]
             im1 = ax[1].imshow(msk_slice, cmap='jet', interpolation='nearest', origin='lower')
             ax[1].set_title(f"Mask (z={mid_z}) Range:[{msk_slice.min():.1f}, {msk_slice.max():.1f}]")
             plt.colorbar(im1, ax=ax[1])
-            
+
         plt.tight_layout()
         save_path = os.path.join(vis_dir, f"{stage}_ep{epoch:03d}_sample{i}.png")
         plt.savefig(save_path)
@@ -388,7 +554,7 @@ def train_teacher(
     device = torch.device(device)
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loading Dataset...")
-    
+
     # --- Dataset Initialization ---
     dataset = NiftiDataset(
         root_dir=data_root,
@@ -414,7 +580,7 @@ def train_teacher(
     channels_to_normalize = list(range(intensity_channels))
     norm_mean = torch.zeros(total_channels, dtype=torch.float32)
     norm_std = torch.ones(total_channels, dtype=torch.float32)
-    
+
     if channels_to_normalize:
         mean_est, std_est = compute_dataset_channel_stats(dataset, channels_to_normalize)
         for idx_ch, ch in enumerate(channels_to_normalize):
@@ -425,7 +591,7 @@ def train_teacher(
             print(f"  - ch{ch}: mean={norm_mean[ch]:.6f}, std={norm_std[ch]:.6f}")
     else:
         print("[Normalize] No intensity channels found for standardisation.")
-    
+
     stats_payload = {
         "mean": norm_mean,
         "std": norm_std,
@@ -490,23 +656,23 @@ def train_teacher(
 
     pin_mem = device.type == 'cuda'
     train_loader = DataLoader(
-        train_ds, 
-        batch_size=batch_size, 
-        sampler=sampler, 
+        train_ds,
+        batch_size=batch_size,
+        sampler=sampler,
         shuffle=False,
-        num_workers=workers, 
-        pin_memory=pin_mem, 
+        num_workers=workers,
+        pin_memory=pin_mem,
         collate_fn=collate_fn,
-        worker_init_fn=_seed_worker if workers > 0 else None, 
-        drop_last=True, 
+        worker_init_fn=_seed_worker if workers > 0 else None,
+        drop_last=True,
         persistent_workers=(workers > 0)
     )
     val_loader = DataLoader(
-        val_ds, 
-        batch_size=batch_size, 
+        val_ds,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=workers, 
-        pin_memory=pin_mem, 
+        num_workers=workers,
+        pin_memory=pin_mem,
         collate_fn=collate_fn,
         worker_init_fn=_seed_worker if workers > 0 else None,
         persistent_workers=(workers > 0)
@@ -589,7 +755,7 @@ def train_teacher(
         optimizer,
         schedulers=[
             LinearLR(optimizer, start_factor=0.5, total_iters=warmup_epochs),
-            CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min = lr * 0.1)
+            CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=lr * 0.1)
         ],
         milestones=[warmup_epochs]
     )
@@ -634,9 +800,13 @@ def train_teacher(
                 log_msg += f", mcc@youden={extras['mcc@youden']:.3f}"
         print(log_msg)
 
-        if epoch % save_every == 0:
+        # [New] Periodic Feature Visualization (t-SNE)
+        if epoch % save_every == 0 or epoch == epochs:
             ckpt_path = os.path.join(outdir, f"checkpoint_epoch{epoch}.pth")
             torch.save(model.state_dict(), ckpt_path)
+
+            # Visualize Validation features
+            visualize_features(model, val_loader, device, outdir, epoch, tag="val")
 
         if val_auc > best_auc:
             best_auc = val_auc
@@ -730,15 +900,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch-size', type=int, default=4)
     # [Hardcoded Safety] Default to 1e-5 to prevent oscillation if pipeline argument fails
-    parser.add_argument('--lr', type=float, default=0.00001) 
+    parser.add_argument('--lr', type=float, default=0.00005)
     parser.add_argument('--num-classes', type=int, default=1)
-    parser.add_argument('--seed', type=int, default=2023)
-    parser.add_argument('--val-split', type=float, default=0.05)
+    parser.add_argument('--seed', type=int, default=2024)
+    parser.add_argument('--val-split', type=float, default=0.2)
     parser.add_argument('--freeze-bn', action='store_true', default=False)
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--max-grad-norm', type=float, default=0.0)
-    parser.add_argument('--save-every', type=int, default=5)
+    parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--use-light-aug', action='store_true', default=False)
     parser.add_argument('--use-pos-weight', action='store_true', default=False)
@@ -756,7 +926,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--target-spacing', type=float, nargs=3, default=[1.5, 1.0, 1.0])
     parser.add_argument('--hu-min', type=float, default=-200.0)
     parser.add_argument('--hu-max', type=float, default=250.0)
-    
+
     # --- Pretrain Args ---
     parser.add_argument('--pretrain-path', type=str, default=None, help='Path to .pth file')
 
@@ -766,7 +936,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: List[str] | None = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    
+
     # DEBUG PRINT to ensure arguments are correct
     print(f"\n{'='*40}")
     print(f"!!! DEBUG CHECK !!!")
@@ -778,44 +948,52 @@ def main(argv: List[str] | None = None) -> None:
     for i in range(args.repeats):
         run_seed = args.seed + i
         rep_outdir = os.path.join(args.outdir, f"rep_{i+1}")
-        print(f"\n========== Repeat {i+1}/{args.repeats} | seed={run_seed} | outdir={rep_outdir} ==========")
-        m = train_teacher(
-            data_root=args.data_root,
-            label_csv=args.label_csv,
-            outdir=rep_outdir,
-            num_classes=args.num_classes,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            seed=run_seed,
-            val_split=args.val_split,
-            freeze_bn=args.freeze_bn,
-            workers=args.workers,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            save_every=args.save_every,
-            use_light_aug=args.use_light_aug,
-            use_pos_weight=args.use_pos_weight,
-            arch=args.arch,
-            in_channels=args.in_channels,
-            norm=args.norm,
-            gn_groups=args.gn_groups,
-            downsample_depth_in_layer4=args.downsample_depth_l4,
-            # --- Args ---
-            crop_mode=args.crop_mode,
-            margin_mm=args.margin,
-            target_size=tuple(args.target_size),
-            target_spacing=tuple(args.target_spacing),
-            hu_window=(args.hu_min, args.hu_max),
-            pretrain_path=args.pretrain_path,
-        )
-        if 'last_auc' not in m:
-             print(f"[WARN] Repeat {i+1} failed or aborted.")
-             continue
-             
-        m['seed'] = run_seed
-        m['repeat'] = i + 1
-        all_metrics.append(m)
+        os.makedirs(rep_outdir, exist_ok=True)
+
+        # [NEW] Each repeat has its own full log
+        rep_log_path = os.path.join(rep_outdir, "train.log")
+
+        with tee_stdout_stderr(rep_log_path):
+            print(f"\n========== Repeat {i+1}/{args.repeats} | seed={run_seed} | outdir={rep_outdir} ==========")
+            print(f"[Log] This repeat log is being saved to: {rep_log_path}")
+
+            m = train_teacher(
+                data_root=args.data_root,
+                label_csv=args.label_csv,
+                outdir=rep_outdir,
+                num_classes=args.num_classes,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                seed=run_seed,
+                val_split=args.val_split,
+                freeze_bn=args.freeze_bn,
+                workers=args.workers,
+                weight_decay=args.weight_decay,
+                max_grad_norm=args.max_grad_norm,
+                save_every=args.save_every,
+                use_light_aug=args.use_light_aug,
+                use_pos_weight=args.use_pos_weight,
+                arch=args.arch,
+                in_channels=args.in_channels,
+                norm=args.norm,
+                gn_groups=args.gn_groups,
+                downsample_depth_in_layer4=args.downsample_depth_l4,
+                # --- Args ---
+                crop_mode=args.crop_mode,
+                margin_mm=args.margin,
+                target_size=tuple(args.target_size),
+                target_spacing=tuple(args.target_spacing),
+                hu_window=(args.hu_min, args.hu_max),
+                pretrain_path=args.pretrain_path,
+            )
+            if 'last_auc' not in m:
+                print(f"[WARN] Repeat {i+1} failed or aborted.")
+                continue
+
+            m['seed'] = run_seed
+            m['repeat'] = i + 1
+            all_metrics.append(m)
 
     if not all_metrics:
         print("[ERROR] No successful runs.")
@@ -858,6 +1036,7 @@ def main(argv: List[str] | None = None) -> None:
         df.to_csv(os.path.join(args.outdir, "all_runs_metrics.csv"), index=False)
         pd.DataFrame(summary_rows).to_csv(os.path.join(args.outdir, "summary.csv"), index=False)
         print(f"\n[INFO] Saved per-run metrics to all_runs_metrics.csv and summary.csv in {args.outdir}")
+        print(f"[INFO] Per-repeat logs: {os.path.join(args.outdir, 'rep_k/train.log')}")
     except Exception as e:
         print(f"[WARN] Summary failed: {e}")
 
