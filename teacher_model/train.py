@@ -8,7 +8,7 @@ import math
 import sys
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Tuple, List, Dict, Any, Sequence
+from typing import Tuple, List, Dict, Any, Sequence, Optional
 
 import numpy as np
 import torch
@@ -21,8 +21,8 @@ from sklearn.metrics import (
     f1_score, matthews_corrcoef, balanced_accuracy_score
 )
 from sklearn.exceptions import UndefinedMetricWarning
-from sklearn.manifold import TSNE  # [New] For visualization
-from sklearn.decomposition import PCA # [New] Optional backup
+from sklearn.manifold import TSNE  # For visualization
+from sklearn.decomposition import PCA  # Optional / speed-up for t-SNE
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 import matplotlib
@@ -40,7 +40,7 @@ from .resnet3d import (
 )
 
 # =============================================================================
-# [NEW] Tee logger: duplicate stdout/stderr to file (per-repeat train.log)
+# Tee logger: duplicate stdout/stderr to file (per-repeat train.log)
 # =============================================================================
 class _TeeStream:
     def __init__(self, *streams):
@@ -51,7 +51,6 @@ class _TeeStream:
             try:
                 s.write(data)
             except Exception:
-                # Don't break training if a stream fails
                 pass
 
     def flush(self):
@@ -62,7 +61,6 @@ class _TeeStream:
                 pass
 
     def isatty(self):
-        # Helps tqdm detect terminal capability
         try:
             return any(getattr(s, "isatty", lambda: False)() for s in self.streams)
         except Exception:
@@ -191,6 +189,10 @@ def compute_dataset_channel_stats(
 
 # ----------------------- BN freeze helpers -----------------------
 def freeze_bn_running_stats(model: nn.Module) -> None:
+    """
+    Freeze BN running mean/var by setting BN to eval.
+    NOTE: This does NOT freeze BN affine params by default (weight/bias stay trainable).
+    """
     for m in model.modules():
         if isinstance(m, nn.modules.batchnorm._BatchNorm):
             m.eval()
@@ -207,6 +209,45 @@ def _set_bn_eval(model: nn.Module) -> None:
 def _current_lr(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
+# ----------------------- [NEW] Head-only finetune helpers -----------------------
+def _unwrap(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+def get_head(model: nn.Module) -> nn.Module:
+    """
+    Your ResNet3D defines classifier head as .fc
+    """
+    m = _unwrap(model)
+    if hasattr(m, "fc"):
+        return m.fc
+    raise AttributeError("Model has no .fc head; cannot head-only finetune.")
+
+def freeze_backbone_train_head(model: nn.Module, verbose: bool = True) -> None:
+    """
+    Freeze everything then unfreeze only classifier head (.fc).
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    head = get_head(model)
+    for p in head.parameters():
+        p.requires_grad_(True)
+
+    if verbose:
+        trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+        total = sum(p.numel() for p in model.parameters())
+        trainable_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[HeadOnly] Trainable params: {trainable_n}/{total} ({(trainable_n/max(1,total))*100:.2f}%)")
+        for n in trainable_names:
+            print("  -", n)
+
+def set_headonly_train_mode(model: nn.Module) -> None:
+    """
+    backbone eval (so BN running stats won't drift), head train
+    """
+    model.eval()
+    get_head(model).train()
+
 # ----------------------- Helpers for BCE -----------------------
 def _pos_logit(outputs: torch.Tensor, num_classes: int) -> torch.Tensor:
     if num_classes == 1:
@@ -218,7 +259,7 @@ def _pos_logit(outputs: torch.Tensor, num_classes: int) -> torch.Tensor:
             raise ValueError(f"Unexpected output shape {tuple(outputs.shape)} for num_classes=1")
     return outputs[:, 1]
 
-# ----------------------- [New] Visualization Logic -----------------------
+# ----------------------- Visualization Logic -----------------------
 class FeatureExtractorHook:
     """
     Hook to capture features from the layer before the final FC.
@@ -228,8 +269,6 @@ class FeatureExtractorHook:
         self.features = []
 
     def hook_fn(self, module, input, output):
-        # output is usually (B, C, 1, 1, 1) or (B, C) depending on avgpool implementation
-        # We flatten it to (B, C)
         self.features.append(output.flatten(start_dim=1).detach().cpu())
 
     def clear(self):
@@ -246,7 +285,10 @@ def visualize_features(
     device: torch.device,
     outdir: str,
     epoch: int,
-    tag: str = "val"
+    tag: str = "val",
+    max_samples: Optional[int] = 600,
+    pca_dim: int = 50,
+    use_pca_before_tsne: bool = True,
 ):
     """
     Extracts features, runs t-SNE, plots scatter plot.
@@ -254,10 +296,9 @@ def visualize_features(
     model.eval()
 
     # Register Hook on avgpool
-    # Adjust this if your ResNet definition names avgpool differently
     if hasattr(model, 'avgpool'):
         target_layer = model.avgpool
-    elif hasattr(model, 'module') and hasattr(model.module, 'avgpool'): # For DataParallel
+    elif hasattr(model, 'module') and hasattr(model.module, 'avgpool'):
         target_layer = model.module.avgpool
     else:
         print("[Vis] Warning: Could not find 'avgpool' layer. Visualization skipped.")
@@ -266,44 +307,78 @@ def visualize_features(
     hook = FeatureExtractorHook()
     handle = target_layer.register_forward_hook(hook.hook_fn)
 
-    all_labels = []
+    all_labels: List[int] = []
 
     try:
         with torch.no_grad():
+            n_collected = 0
             for volumes, labels in tqdm(dataloader, desc=f"Vis-{tag}", leave=False):
-                volumes = volumes.to(device)
-                _ = model(volumes) # Forward pass triggers hook
-                all_labels.extend(labels.numpy())
+                volumes = volumes.to(device, non_blocking=True)
+                _ = model(volumes)  # Forward pass triggers hook
+
+                if torch.is_tensor(labels):
+                    labels_np = labels.detach().cpu().numpy()
+                else:
+                    labels_np = np.asarray(labels)
+                all_labels.extend(labels_np.tolist())
+
+                n_collected += int(volumes.size(0))
+                if max_samples is not None and n_collected >= max_samples:
+                    break
 
         feats = hook.get_features()
-        labels_np = np.array(all_labels)
+        labels_np = np.array(all_labels, dtype=int)
 
         if feats is None or len(feats) == 0:
             print("[Vis] No features captured.")
             return
 
-        # t-SNE Calculation
-        # Perplexity must be < n_samples. Default 30.
+        if feats.shape[0] != labels_np.shape[0]:
+            n = min(feats.shape[0], labels_np.shape[0])
+            feats = feats[:n]
+            labels_np = labels_np[:n]
+
         n_samples = feats.shape[0]
-        perp = min(30, max(5, n_samples // 3)) # auto-adjust perplexity for small val sets
+        feat_dim = feats.shape[1]
 
-        print(f"[Vis] Computing t-SNE on {n_samples} samples (dim={feats.shape[1]})...")
-        tsne = TSNE(n_components=2, perplexity=perp, random_state=42, init='pca', learning_rate='auto')
-        feats_embedded = tsne.fit_transform(feats)
+        if n_samples < 5:
+            print(f"[Vis] Too few samples for t-SNE (n={n_samples}). Skipped.")
+            return
 
-        # Plotting
+        feats_for_tsne = feats
+
+        if use_pca_before_tsne and feat_dim > pca_dim:
+            try:
+                pca = PCA(n_components=min(pca_dim, feat_dim), random_state=42)
+                feats_for_tsne = pca.fit_transform(feats_for_tsne)
+                print(f"[Vis] PCA reduced: {feat_dim} -> {feats_for_tsne.shape[1]}")
+            except Exception as e:
+                print(f"[Vis] PCA failed, fallback to raw feats. Err={e}")
+                feats_for_tsne = feats
+
+        perp = min(30, max(5, (n_samples - 1) // 3))
+
+        print(f"[Vis] Computing t-SNE on {n_samples} samples (dim={feats_for_tsne.shape[1]}) [{tag}]...")
+        tsne = TSNE(
+            n_components=2,
+            perplexity=perp,
+            random_state=42,
+            init='pca',
+            learning_rate='auto'
+        )
+        feats_embedded = tsne.fit_transform(feats_for_tsne)
+
         plt.figure(figsize=(8, 6))
+        colors = ['blue' if int(l) == 0 else 'red' for l in labels_np]
+        plt.scatter(
+            feats_embedded[:, 0], feats_embedded[:, 1],
+            c=colors, alpha=0.6, edgecolors='k', s=60
+        )
 
-        # Color map: 0=Blue, 1=Red
-        colors = ['blue' if l == 0 else 'red' for l in labels_np]
-
-        plt.scatter(feats_embedded[:, 0], feats_embedded[:, 1], c=colors, alpha=0.6, edgecolors='k', s=60)
-
-        # Create legend manually
         from matplotlib.lines import Line2D
         legend_elements = [
             Line2D([0], [0], marker='o', color='w', label='Class 0 (Neg)', markerfacecolor='blue', markersize=10),
-            Line2D([0], [0], marker='o', color='w', label='Class 1 (Pos)', markerfacecolor='red', markersize=10)
+            Line2D([0], [0], marker='o', color='w', label='Class 1 (Pos)', markerfacecolor='red', markersize=10),
         ]
         plt.legend(handles=legend_elements, loc="upper right")
 
@@ -321,10 +396,10 @@ def visualize_features(
     except Exception as e:
         print(f"[Vis] Error during visualization: {e}")
     finally:
-        handle.remove() # Clean up hook
+        handle.remove()
         hook.clear()
 
-# ----------------------- [New] Diagnostics -----------------------
+# ----------------------- Diagnostics -----------------------
 def debug_visualize_batch(volumes: torch.Tensor, labels: torch.Tensor, outdir: str, epoch: int, stage: str = "train"):
     """
     [Diagnostic Tool] Sample and save model input tensors as images.
@@ -333,15 +408,11 @@ def debug_visualize_batch(volumes: torch.Tensor, labels: torch.Tensor, outdir: s
     os.makedirs(vis_dir, exist_ok=True)
     batch_size = volumes.shape[0]
 
-    # Check first 2 samples
     for i in range(min(2, batch_size)):
         vol = volumes[i].detach().cpu().numpy()  # (C, D, H, W)
         label = labels[i].item()
 
-        # Middle slice
         mid_z = vol.shape[1] // 2
-
-        # Image Channel
         img_slice = vol[0, mid_z]
 
         n_channels = vol.shape[0]
@@ -349,12 +420,13 @@ def debug_visualize_batch(volumes: torch.Tensor, labels: torch.Tensor, outdir: s
         if n_channels == 1:
             ax = [ax]
 
-        # Draw CT
         im0 = ax[0].imshow(img_slice, cmap='gray', origin='lower')
-        ax[0].set_title(f"Ep{epoch} | BatchSample {i} | Lbl {label}\nCT (z={mid_z}) Range:[{img_slice.min():.1f}, {img_slice.max():.1f}]")
+        ax[0].set_title(
+            f"Ep{epoch} | BatchSample {i} | Lbl {label}\n"
+            f"CT (z={mid_z}) Range:[{img_slice.min():.1f}, {img_slice.max():.1f}]"
+        )
         plt.colorbar(im0, ax=ax[0])
 
-        # Draw Mask (if exists)
         if n_channels > 1:
             msk_slice = vol[1, mid_z]
             im1 = ax[1].imshow(msk_slice, cmap='jet', interpolation='nearest', origin='lower')
@@ -376,20 +448,38 @@ def train_one_epoch(
     num_classes: int,
     max_grad_norm: float | None = 0.0,
     dbg_prob_log: bool = False,
-    freeze_bn=False,
+    freeze_bn: bool = False,
     scaler: GradScaler | None = None,
     amp_dtype: torch.dtype = torch.float16,
     epoch: int = 0,
     outdir: str = "",
+    # ---------------- [NEW] head-only flag ----------------
+    head_only: bool = False,
 ) -> float:
-    model.train()
-    if freeze_bn:
-        _set_bn_eval(model)
+    # [NEW] head-only: backbone eval + head train; else normal training
+    if head_only:
+        set_headonly_train_mode(model)
+    else:
+        model.train()
+        if freeze_bn:
+            _set_bn_eval(model)
 
     running_loss = 0.0
     n_samples = 0
     pbar = tqdm(dataloader, desc=f"Train(lr={_current_lr(optimizer):.2e})", leave=False)
     first_dbg_done = False
+
+    # [NEW] hard debug: check backbone weight delta after first step (head-only)
+    w_before = None
+    if head_only and epoch == 1:
+        try:
+            m = _unwrap(model)
+            if hasattr(m, "layer1") and len(m.layer1) > 0 and hasattr(m.layer1[0], "conv1"):
+                w_before = m.layer1[0].conv1.weight.detach().clone()
+            else:
+                w_before = m.conv1.weight.detach().clone()
+        except Exception:
+            w_before = None
 
     for i, (volumes, labels) in enumerate(pbar):
         # --- Diagnostic Visualization ---
@@ -401,6 +491,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         use_amp = scaler is not None and scaler.is_enabled()
+
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             outputs = model(volumes)
             pos_logit = _pos_logit(outputs, num_classes)
@@ -426,14 +517,40 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
-        # --- Grad Norm Check (Epoch 1 Only) ---
+        # --- [NEW] Head-only debug checks (Epoch 1, Batch 0) ---
         if epoch == 1 and i == 0:
-            total_norm = 0.0
-            for p in model.parameters():
+            # 1) head grad norm and presence
+            head = get_head(model)
+            head_norm2 = 0.0
+            head_has_grad = 0
+            for p in head.parameters():
                 if p.grad is not None:
-                    total_norm += p.grad.data.norm(2).item() ** 2
-            total_norm = total_norm ** 0.5
-            print(f"\n[DIAGNOSTIC] Epoch 1 First Batch Grad Norm: {total_norm:.4f} (Expect > 0)")
+                    head_has_grad += 1
+                    head_norm2 += p.grad.data.norm(2).item() ** 2
+            print(f"\n[DIAG] head grad norm: {(head_norm2**0.5):.6f}, head_params_with_grad={head_has_grad}")
+
+            # 2) frozen params should not have grads
+            if head_only:
+                frozen_with_grad = []
+                for n, p in model.named_parameters():
+                    if (not p.requires_grad) and (p.grad is not None):
+                        frozen_with_grad.append(n)
+                print(f"[DIAG] frozen_params_with_grad={len(frozen_with_grad)} (expect 0)")
+                if len(frozen_with_grad) > 0:
+                    print("[WARN] Some frozen params still have grad:", frozen_with_grad[:10])
+
+            # 3) backbone weight delta after one step should be 0 in head-only
+            if head_only and w_before is not None:
+                try:
+                    m = _unwrap(model)
+                    if hasattr(m, "layer1") and len(m.layer1) > 0 and hasattr(m.layer1[0], "conv1"):
+                        w_after = m.layer1[0].conv1.weight.detach()
+                    else:
+                        w_after = m.conv1.weight.detach()
+                    delta = (w_after - w_before).abs().max().item()
+                    print(f"[DIAG] backbone weight max|delta| after 1 step: {delta:.8e} (expect 0)")
+                except Exception as e:
+                    print(f"[DIAG] backbone delta check failed: {e}")
 
         bs = volumes.size(0)
         running_loss += float(loss.item()) * bs
@@ -442,7 +559,10 @@ def train_one_epoch(
         if dbg_prob_log and not first_dbg_done:
             with torch.no_grad():
                 probs = torch.sigmoid(pos_logit)
-                print(f"[Log] Batch0 Probs: Mean={probs.mean().item():.3f} Std={probs.std().item():.3f} (Min={probs.min():.3f}, Max={probs.max():.3f})")
+                print(
+                    f"[Log] Batch0 Probs: Mean={probs.mean().item():.3f} Std={probs.std().item():.3f} "
+                    f"(Min={probs.min():.3f}, Max={probs.max():.3f})"
+                )
             first_dbg_done = True
 
         pbar.set_postfix(loss=running_loss / max(1, n_samples))
@@ -492,6 +612,7 @@ def evaluate(
     except ValueError:
         warnings.warn("AUC undefined (single-class in validation); set to 0.5", UndefinedMetricWarning)
         auc = 0.5
+
     try:
         auprc = average_precision_score(labels_concat, probs_concat)
     except ValueError:
@@ -521,7 +642,7 @@ def train_teacher(
     num_classes: int = 1,
     epochs: int = 60,
     batch_size: int = 4,
-    lr: float = 1e-5, # Default set low safely
+    lr: float = 1e-5,
     seed: int = 42,
     val_split: float = 0.3,
     device: str | torch.device = 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -545,6 +666,8 @@ def train_teacher(
     hu_window: Tuple[float, float] = (-200.0, 250.0),
     # --- Pretrain Args ---
     pretrain_path: str | None = None,
+    # --- [NEW] Head-only finetune ---
+    train_head_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Single Run Entry Point.
@@ -555,7 +678,6 @@ def train_teacher(
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loading Dataset...")
 
-    # --- Dataset Initialization ---
     dataset = NiftiDataset(
         root_dir=data_root,
         label_csv=label_csv,
@@ -568,6 +690,7 @@ def train_teacher(
         hu_window=hu_window,
         window_adaptive=True,
     )
+
     df_meta = pd.read_csv(label_csv, encoding="utf-8-sig")
     assert len(df_meta) == len(dataset), "CSV rows must match dataset length."
     labels_all = df_meta["label"].values.astype(int)
@@ -592,11 +715,7 @@ def train_teacher(
     else:
         print("[Normalize] No intensity channels found for standardisation.")
 
-    stats_payload = {
-        "mean": norm_mean,
-        "std": norm_std,
-        "channels": channels_to_normalize,
-    }
+    stats_payload = {"mean": norm_mean, "std": norm_std, "channels": channels_to_normalize}
     stats_path = os.path.join(outdir, "channel_stats.pt")
     torch.save(stats_payload, stats_path)
     print(f"[Normalize] Saved statistics to {stats_path}")
@@ -608,7 +727,7 @@ def train_teacher(
     )
 
     train_labels = labels_all[train_idx]
-    val_labels   = labels_all[val_idx]
+    val_labels = labels_all[val_idx]
     pos = int((train_labels == 1).sum())
     neg = int((train_labels == 0).sum())
     print(f"[Split] train {len(train_idx)} (pos={pos}, neg={neg}) | "
@@ -617,9 +736,13 @@ def train_teacher(
     # --- Augmentation & Transforms ---
     if use_light_aug:
         aug_transform = LightAugment3D(
-            p_flip=0.5, p_rotate=0.3,
-            max_rotate_deg=5.0,
-            p_gamma=0.0, p_contrast=0.0,
+            p_flip=0.5,
+            p_rotate=0.5,
+            p_gamma=0.5,
+            p_contrast=0.5,
+            p_noise=0.5,
+            max_rotate_deg=15.0,
+            max_noise_std=0.05,
             intensity_channels=1,
         )
     else:
@@ -629,7 +752,10 @@ def train_teacher(
     val_transform = Compose3D([norm_transform])
 
     train_ds = SubsetWithTransform(dataset, train_idx, transform=train_transform)
-    val_ds   = SubsetWithTransform(dataset, val_idx, transform=val_transform)
+    val_ds = SubsetWithTransform(dataset, val_idx, transform=val_transform)
+
+    # train-vis loader without augmentation (more stable t-SNE)
+    train_vis_ds = SubsetWithTransform(dataset, train_idx, transform=val_transform)
 
     def collate_fn(batch):
         volumes, labels_b = zip(*batch)
@@ -637,7 +763,7 @@ def train_teacher(
         labels_b = torch.tensor(labels_b, dtype=torch.long)
         return volumes, labels_b
 
-    # --- WeightedRandomSampler (Class Balance) ---
+    # --- WeightedRandomSampler ---
     class_count = np.array([(train_labels == 0).sum(), (train_labels == 1).sum()], dtype=float)
     w_per_class = 1.0 / np.maximum(class_count, 1.0)
     sample_w = np.array([w_per_class[int(l)] for l in train_labels], dtype=float)
@@ -647,7 +773,6 @@ def train_teacher(
         replacement=True
     )
 
-    # --- DataLoaders ---
     def _seed_worker(worker_id: int):
         worker_seed = seed + worker_id
         np.random.seed(worker_seed)
@@ -675,6 +800,17 @@ def train_teacher(
         pin_memory=pin_mem,
         collate_fn=collate_fn,
         worker_init_fn=_seed_worker if workers > 0 else None,
+        persistent_workers=(workers > 0)
+    )
+    train_vis_loader = DataLoader(
+        train_vis_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=pin_mem,
+        collate_fn=collate_fn,
+        worker_init_fn=_seed_worker if workers > 0 else None,
+        drop_last=False,
         persistent_workers=(workers > 0)
     )
 
@@ -707,20 +843,22 @@ def train_teacher(
 
     # --- Pre-trained Weights Loading ---
     if pretrain_path and os.path.exists(pretrain_path):
-        # 1. Load MedicalNet weights if path provided
         load_medicalnet_weights(model, pretrain_path)
     else:
-        # 2. Or fallback to Inflation (Optional, or just random)
         print("[Init] No pretrain path provided or file not found. Using random init.")
-        # Uncomment below if you want automatic 2D inflation when no 3D weight is given
+        # Optional 2D inflation
         # try:
         #     load_pretrained_2d_weights_to_3d(model, arch=arch)
         # except Exception as e:
         #     print(f"[WARN] Failed to inflate 2D weights: {e}")
 
-    # Freeze BN if needed (post-loading)
+    # Freeze BN running stats if needed (post-loading)
     if freeze_bn and norm.lower() == "bn":
         freeze_bn_running_stats(model)
+
+    # --- [NEW] Head-only finetune: freeze backbone after loading weights ---
+    if train_head_only:
+        freeze_backbone_train_head(model, verbose=True)
 
     # --- Loss Function ---
     if use_pos_weight:
@@ -742,6 +880,7 @@ def train_teacher(
             decay.append(p)
         else:
             no_decay.append(p)
+
     optimizer = torch.optim.AdamW(
         [{'params': decay, 'weight_decay': weight_decay},
          {'params': no_decay, 'weight_decay': 0.0}],
@@ -769,12 +908,22 @@ def train_teacher(
     scaler = GradScaler(enabled=amp_enabled)
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Start Training...")
+    if train_head_only:
+        print("[HeadOnly] Enabled: only .fc will be trained; backbone frozen & kept in eval mode each epoch.")
+        
+    best_loss = float("inf")
+    best_snapshot = {}
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(
             model, train_loader, device, criterion, optimizer, num_classes,
-            max_grad_norm=max_grad_norm, dbg_prob_log=(epoch == 1), freeze_bn=(freeze_bn and norm.lower()=="bn"),
-            scaler=scaler, amp_dtype=torch.float16,
-            epoch=epoch, outdir=outdir  # Passing for diagnostics
+            max_grad_norm=max_grad_norm,
+            dbg_prob_log=(epoch == 1),
+            freeze_bn=(freeze_bn and norm.lower() == "bn"),
+            scaler=scaler,
+            amp_dtype=torch.float16,
+            epoch=epoch,
+            outdir=outdir,
+            head_only=train_head_only,  # [NEW]
         )
         if math.isnan(train_loss):
             print(f"[FATAL] Train loss is NaN at epoch {epoch}. Aborting run.")
@@ -800,22 +949,36 @@ def train_teacher(
                 log_msg += f", mcc@youden={extras['mcc@youden']:.3f}"
         print(log_msg)
 
-        # [New] Periodic Feature Visualization (t-SNE)
+        # Periodic Feature Visualization (t-SNE) + checkpoints
         if epoch % save_every == 0 or epoch == epochs:
             ckpt_path = os.path.join(outdir, f"checkpoint_epoch{epoch}.pth")
             torch.save(model.state_dict(), ckpt_path)
 
-            # Visualize Validation features
-            visualize_features(model, val_loader, device, outdir, epoch, tag="val")
+            visualize_features(
+                model, train_vis_loader, device, outdir, epoch,
+                tag="train",
+                max_samples=800,
+                pca_dim=50,
+                use_pca_before_tsne=True,
+            )
+            visualize_features(
+                model, val_loader, device, outdir, epoch,
+                tag="val",
+                max_samples=800,
+                pca_dim=50,
+                use_pca_before_tsne=True,
+            )
 
-        if val_auc > best_auc:
-            best_auc = val_auc
-            torch.save(model.state_dict(), os.path.join(outdir, 'best_model.pth'))
+        eps = 1e-6  # 防止浮点抖动导致频繁覆盖（可按需调大一点如 1e-4）
+        if val_loss < best_loss - eps:
+            best_loss = float(val_loss)
+            torch.save(model.state_dict(), os.path.join(outdir, "best_model.pth"))
+
             best_snapshot = dict(
                 best_epoch=epoch,
+                best_val_loss=float(val_loss),
                 best_val_auc=float(val_auc),
                 best_val_ece=float(val_ece),
-                best_val_loss=float(val_loss),
             )
             best_snapshot.update(extras)
 
@@ -898,8 +1061,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--label-csv', required=True, help='CSV mapping case to label')
     parser.add_argument('--outdir', required=True, help='Directory to store outputs')
     parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--batch-size', type=int, default=4)
-    # [Hardcoded Safety] Default to 1e-5 to prevent oscillation if pipeline argument fails
+    parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=0.00005)
     parser.add_argument('--num-classes', type=int, default=1)
     parser.add_argument('--seed', type=int, default=2024)
@@ -921,27 +1083,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # --- Spatial Args ---
     parser.add_argument('--crop-mode', type=str, default='bbox', choices=['bbox', 'none'])
-    parser.add_argument('--margin', type=float, default=20.0)
+    parser.add_argument('--margin', type=float, default=0)
     parser.add_argument('--target-size', type=int, nargs=3, default=[112, 144, 144])
     parser.add_argument('--target-spacing', type=float, nargs=3, default=[1.5, 1.0, 1.0])
-    parser.add_argument('--hu-min', type=float, default=-200.0)
-    parser.add_argument('--hu-max', type=float, default=250.0)
+    parser.add_argument('--hu-min', type=float, default=-100.0)
+    parser.add_argument('--hu-max', type=float, default=200.0)
 
     # --- Pretrain Args ---
     parser.add_argument('--pretrain-path', type=str, default=None, help='Path to .pth file')
 
-    return parser
+    # --- [NEW] Head-only finetune ---
+    parser.add_argument('--train-head-only', action='store_true', default=False,
+                        help='Only train classifier head (.fc); freeze backbone.')
 
+    return parser
 
 def main(argv: List[str] | None = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    # DEBUG PRINT to ensure arguments are correct
     print(f"\n{'='*40}")
     print(f"!!! DEBUG CHECK !!!")
     print(f"  - Actual LR: {args.lr:.10f}")
     print(f"  - Pretrain Path: {args.pretrain_path}")
+    print(f"  - Train Head Only: {args.train_head_only}")
     print(f"{'='*40}\n")
 
     all_metrics: List[Dict[str, Any]] = []
@@ -950,7 +1115,6 @@ def main(argv: List[str] | None = None) -> None:
         rep_outdir = os.path.join(args.outdir, f"rep_{i+1}")
         os.makedirs(rep_outdir, exist_ok=True)
 
-        # [NEW] Each repeat has its own full log
         rep_log_path = os.path.join(rep_outdir, "train.log")
 
         with tee_stdout_stderr(rep_log_path):
@@ -979,13 +1143,13 @@ def main(argv: List[str] | None = None) -> None:
                 norm=args.norm,
                 gn_groups=args.gn_groups,
                 downsample_depth_in_layer4=args.downsample_depth_l4,
-                # --- Args ---
                 crop_mode=args.crop_mode,
                 margin_mm=args.margin,
                 target_size=tuple(args.target_size),
                 target_spacing=tuple(args.target_spacing),
                 hu_window=(args.hu_min, args.hu_max),
                 pretrain_path=args.pretrain_path,
+                train_head_only=args.train_head_only,  # [NEW]
             )
             if 'last_auc' not in m:
                 print(f"[WARN] Repeat {i+1} failed or aborted.")
@@ -1039,7 +1203,6 @@ def main(argv: List[str] | None = None) -> None:
         print(f"[INFO] Per-repeat logs: {os.path.join(args.outdir, 'rep_k/train.log')}")
     except Exception as e:
         print(f"[WARN] Summary failed: {e}")
-
 
 if __name__ == '__main__':
     main()

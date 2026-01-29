@@ -147,6 +147,7 @@ def _normalize_hu_to_m11(x: np.ndarray, hu_min: float, hu_max: float) -> np.ndar
 class LightAugment3D:
     """
     Lightweight geometric augmentation.
+    [UPDATED] Now supports Gaussian Noise injection for NCCT robustness.
     """
     def __init__(
         self,
@@ -154,9 +155,11 @@ class LightAugment3D:
         p_rotate: float = 0.5,
         p_gamma: float = 0.5,
         p_contrast: float = 0.5,
+        p_noise: float = 0.5,          # [新增] 噪声概率
         max_rotate_deg: float = 5.0,
         max_gamma_delta: float = 0.10,
         max_contrast_delta: float = 0.10,
+        max_noise_std: float = 0.05,   # [新增] 噪声标准差 (相对于 [-1, 1] 范围)
         padding_mode: str = "border",
         intensity_channels: int = 1,
     ) -> None:
@@ -164,9 +167,13 @@ class LightAugment3D:
         self.p_rotate = float(p_rotate)
         self.p_gamma = float(p_gamma)
         self.p_contrast = float(p_contrast)
+        self.p_noise = float(p_noise)
+        
         self.max_rotate_deg = float(max_rotate_deg)
         self.max_gamma_delta = float(max_gamma_delta)
         self.max_contrast_delta = float(max_contrast_delta)
+        self.max_noise_std = float(max_noise_std)
+        
         self.padding_mode = padding_mode
         self.intensity_channels = int(max(0, intensity_channels))
 
@@ -202,6 +209,15 @@ class LightAugment3D:
         out = vol * factor
         return out.clamp(-1.0, 1.0)
 
+    def _gaussian_noise(self, vol: torch.Tensor, max_std: float) -> torch.Tensor:
+        """
+        [新增] 添加高斯噪声
+        """
+        std = random.uniform(0, max_std)
+        noise = torch.randn_like(vol) * std
+        out = vol + noise
+        return out.clamp(-1.0, 1.0)
+
     def __call__(self, vol: torch.Tensor) -> torch.Tensor:
         if vol.ndim != 4:
             raise ValueError(f"Expected (C,D,H,W) tensor, got {tuple(vol.shape)}")
@@ -217,6 +233,11 @@ class LightAugment3D:
         if self.intensity_channels > 0:
             ch = min(self.intensity_channels, vol.size(0))
             intensity = vol[:ch]
+            
+            # [关键] 噪声注入：防止模型过拟合 NCCT 的微观噪声纹理
+            if self._maybe(self.p_noise):
+                intensity = self._gaussian_noise(intensity, self.max_noise_std)
+
             if self._maybe(self.p_gamma):
                 intensity = self._gamma_jitter(intensity, self.max_gamma_delta)
             if self._maybe(self.p_contrast):
@@ -225,6 +246,7 @@ class LightAugment3D:
             if ch == vol.size(0):
                 vol = intensity
             else:
+                # 重新拼回 Mask
                 vol = torch.cat([intensity, vol[ch:]], dim=0)
         return vol
 
