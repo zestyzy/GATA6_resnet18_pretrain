@@ -389,6 +389,27 @@ class NiftiDataset(Dataset):
         return len(self.samples)
 
     def _load_case(self, img_path: str, mask_path: str) -> torch.Tensor:
+        img_roi, msk_roi = self._prepare_roi(img_path, mask_path)
+        wmin, wmax = self._compute_window_params(img_roi, msk_roi)
+        img_roi = _normalize_hu_to_m11(img_roi, wmin, wmax)
+        msk_roi = (msk_roi > 0).astype(np.float32)
+
+        # 5. Final Resize to Fixed Tensor Shape (Interpolate)
+        #    This effectively "zooms" the cropped ROI to fill the target volume.
+        img_t = torch.from_numpy(img_roi).unsqueeze(0).unsqueeze(0) # (1,1,D,H,W)
+        img_t = F.interpolate(img_t, size=self.target_size, mode="trilinear", align_corners=False).squeeze(0) # (1,D,H,W)
+
+        if self.include_mask_channel:
+            msk_t = torch.from_numpy(msk_roi).unsqueeze(0).unsqueeze(0)
+            msk_t = F.interpolate(msk_t, size=self.target_size, mode="nearest").squeeze(0)
+            # Concatenate: Channel 0 = Image, Channel 1 = Mask
+            vol = torch.cat([img_t, msk_t], dim=0) # (2,D,H,W)
+        else:
+            vol = img_t
+
+        return vol
+
+    def _prepare_roi(self, img_path: str, mask_path: str) -> Tuple[np.ndarray, np.ndarray]:
         # 1. Load Data & Spacing (Align orientation)
         img_np, spacing_in = _load_nifti_with_spacing(img_path)
         msk_np, _ = _load_nifti_with_spacing(mask_path)
@@ -409,7 +430,7 @@ class NiftiDataset(Dataset):
             mx = _round_int(self.margin_mm / self.target_spacing[2])
             # Expand BBox
             bbox = expand_bounding_box_vox(bbox, (mz, my, mx), img_rs.shape)
-            
+
             z, y, x = bbox
             img_roi = img_rs[z, y, x]
             msk_roi = msk_rs[z, y, x]
@@ -418,43 +439,48 @@ class NiftiDataset(Dataset):
             img_roi = img_rs
             msk_roi = msk_rs
 
-        # 4. Intensity Normalization
-        #    Adaptive windowing based on the ROI computed above
+        return img_roi, msk_roi
+
+    def _compute_window_params(self, img_roi: np.ndarray, msk_roi: np.ndarray) -> Tuple[float, float]:
+        # Adaptive windowing based on the ROI computed above
         if self.window_adaptive:
             valid_mask = (msk_roi > 0.5)
             if valid_mask.any():
                 roi_pixels = img_roi[valid_mask]
-            else:
-                roi_pixels = img_roi[np.isfinite(img_roi)] # Fallback
-            
-            try:
-                wmin = float(np.percentile(roi_pixels, self.window_percentiles[0]))
-                wmax = float(np.percentile(roi_pixels, self.window_percentiles[1]))
-                # Safety check for degenerate window
-                if wmax - wmin < 1e-3:
+                try:
+                    wmin = float(np.percentile(roi_pixels, self.window_percentiles[0]))
+                    wmax = float(np.percentile(roi_pixels, self.window_percentiles[1]))
+                    # Safety check for degenerate window
+                    if wmax - wmin < 1e-3:
+                        wmin, wmax = self.hu_min, self.hu_max
+                except Exception:
                     wmin, wmax = self.hu_min, self.hu_max
-            except:
+            else:
+                # If no lesion mask is available, fall back to fixed HU window
                 wmin, wmax = self.hu_min, self.hu_max
         else:
             wmin, wmax = self.hu_min, self.hu_max
 
-        img_roi = _normalize_hu_to_m11(img_roi, wmin, wmax)
-        msk_roi = (msk_roi > 0).astype(np.float32)
+        return wmin, wmax
 
-        # 5. Final Resize to Fixed Tensor Shape (Interpolate)
-        #    This effectively "zooms" the cropped ROI to fill the target volume.
-        img_t = torch.from_numpy(img_roi).unsqueeze(0).unsqueeze(0) # (1,1,D,H,W)
-        img_t = F.interpolate(img_t, size=self.target_size, mode="trilinear", align_corners=False).squeeze(0) # (1,D,H,W)
-
-        if self.include_mask_channel:
-            msk_t = torch.from_numpy(msk_roi).unsqueeze(0).unsqueeze(0)
-            msk_t = F.interpolate(msk_t, size=self.target_size, mode="nearest").squeeze(0)
-            # Concatenate: Channel 0 = Image, Channel 1 = Mask
-            vol = torch.cat([img_t, msk_t], dim=0) # (2,D,H,W)
-        else:
-            vol = img_t
-
-        return vol
+    def compute_window_stats(self, idx: int, hist_bins: int | None = None) -> Dict[str, np.ndarray | float]:
+        cid, i_p, m_p, lbl = self.samples[idx]
+        img_roi, msk_roi = self._prepare_roi(i_p, m_p)
+        wmin, wmax = self._compute_window_params(img_roi, msk_roi)
+        img_win = _normalize_hu_to_m11(img_roi, wmin, wmax)
+        stats: Dict[str, np.ndarray | float] = {
+            "case_id": cid,
+            "label": int(lbl),
+            "wmin": float(wmin),
+            "wmax": float(wmax),
+            "mean": float(np.mean(img_win)),
+            "std": float(np.std(img_win)),
+        }
+        if hist_bins is not None and hist_bins > 0:
+            hist, bin_edges = np.histogram(img_win, bins=int(hist_bins), range=(-1.0, 1.0))
+            stats["hist"] = hist.astype(np.int64)
+            stats["bin_edges"] = bin_edges.astype(np.float32)
+        return stats
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         cid, i_p, m_p, lbl = self.samples[idx]
