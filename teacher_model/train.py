@@ -664,8 +664,14 @@ def train_teacher(
     target_size: Tuple[int, int, int] = (112, 144, 144),
     target_spacing: Tuple[float, float, float] = (1.5, 1.0, 1.0),
     hu_window: Tuple[float, float] = (-200.0, 250.0),
+    window_adaptive: bool = True,
     # --- Pretrain Args ---
     pretrain_path: str | None = None,
+    use_channel_normalize: bool = True,
+    use_weighted_sampler: bool = False,
+    dump_window_stats: str | None = None,
+    dump_window_hists: str | None = None,
+    window_hist_bins: int = 128,
     # --- [NEW] Head-only finetune ---
     train_head_only: bool = False,
 ) -> Dict[str, Any]:
@@ -688,38 +694,32 @@ def train_teacher(
         target_size=target_size,
         target_spacing=target_spacing,
         hu_window=hu_window,
-        window_adaptive=True,
+        window_adaptive=window_adaptive,
     )
+
+    if dump_window_stats or dump_window_hists:
+        if dump_window_hists:
+            os.makedirs(dump_window_hists, exist_ok=True)
+        rows = []
+        hist_bins = window_hist_bins if dump_window_hists else None
+        for idx in tqdm(range(len(dataset)), desc="Window stats", leave=False):
+            stats = dataset.compute_window_stats(idx, hist_bins=hist_bins)
+            if dump_window_hists and "hist" in stats and "bin_edges" in stats:
+                cid = str(stats["case_id"]).replace(os.sep, "_")
+                hist_path = os.path.join(dump_window_hists, f"{cid}_hist.npz")
+                np.savez_compressed(
+                    hist_path,
+                    hist=np.asarray(stats.pop("hist")),
+                    bin_edges=np.asarray(stats.pop("bin_edges")),
+                )
+            rows.append(stats)
+        if dump_window_stats:
+            pd.DataFrame(rows).to_csv(dump_window_stats, index=False, encoding="utf-8-sig")
 
     df_meta = pd.read_csv(label_csv, encoding="utf-8-sig")
     assert len(df_meta) == len(dataset), "CSV rows must match dataset length."
     labels_all = df_meta["label"].values.astype(int)
     indices = np.arange(len(dataset))
-
-    # --- Normalization Stats ---
-    sample_vol, _ = dataset[0]
-    total_channels = sample_vol.shape[0]
-    intensity_channels = min(1, total_channels)
-    channels_to_normalize = list(range(intensity_channels))
-    norm_mean = torch.zeros(total_channels, dtype=torch.float32)
-    norm_std = torch.ones(total_channels, dtype=torch.float32)
-
-    if channels_to_normalize:
-        mean_est, std_est = compute_dataset_channel_stats(dataset, channels_to_normalize)
-        for idx_ch, ch in enumerate(channels_to_normalize):
-            norm_mean[ch] = mean_est[idx_ch]
-            norm_std[ch] = std_est[idx_ch]
-        print("[Normalize] channel statistics (mean/std):")
-        for ch in channels_to_normalize:
-            print(f"  - ch{ch}: mean={norm_mean[ch]:.6f}, std={norm_std[ch]:.6f}")
-    else:
-        print("[Normalize] No intensity channels found for standardisation.")
-
-    stats_payload = {"mean": norm_mean, "std": norm_std, "channels": channels_to_normalize}
-    stats_path = os.path.join(outdir, "channel_stats.pt")
-    torch.save(stats_payload, stats_path)
-    print(f"[Normalize] Saved statistics to {stats_path}")
-    norm_transform = ChannelNormalize(norm_mean.tolist(), norm_std.tolist(), channels=channels_to_normalize)
 
     # --- Stratified Split ---
     train_idx, val_idx = train_test_split(
@@ -732,6 +732,37 @@ def train_teacher(
     neg = int((train_labels == 0).sum())
     print(f"[Split] train {len(train_idx)} (pos={pos}, neg={neg}) | "
           f"val {len(val_idx)} (pos={(val_labels==1).sum()}, neg={(val_labels==0).sum()})")
+
+    sample_vol, _ = dataset[0]
+    total_channels = sample_vol.shape[0]
+    intensity_channels = min(1, total_channels)
+    channels_to_normalize = list(range(intensity_channels))
+    norm_mean = torch.zeros(total_channels, dtype=torch.float32)
+    norm_std = torch.ones(total_channels, dtype=torch.float32)
+
+    if use_channel_normalize and channels_to_normalize:
+        # --- Normalization Stats (train split only) ---
+        train_stat_ds = SubsetWithTransform(dataset, train_idx, transform=None)
+        mean_est, std_est = compute_dataset_channel_stats(train_stat_ds, channels_to_normalize)
+        for idx_ch, ch in enumerate(channels_to_normalize):
+            norm_mean[ch] = mean_est[idx_ch]
+            norm_std[ch] = std_est[idx_ch]
+        print("[Normalize] channel statistics (mean/std) on train split:")
+        for ch in channels_to_normalize:
+            print(f"  - ch{ch}: mean={norm_mean[ch]:.6f}, std={norm_std[ch]:.6f}")
+    elif not use_channel_normalize:
+        print("[Normalize] Channel normalization disabled; using mean=0/std=1.")
+    else:
+        print("[Normalize] No intensity channels found for standardisation.")
+
+    stats_payload = {"mean": norm_mean, "std": norm_std, "channels": channels_to_normalize}
+    stats_path = os.path.join(outdir, "channel_stats.pt")
+    torch.save(stats_payload, stats_path)
+    print(f"[Normalize] Saved statistics to {stats_path}")
+    norm_transform = (
+        ChannelNormalize(norm_mean.tolist(), norm_std.tolist(), channels=channels_to_normalize)
+        if use_channel_normalize else None
+    )
 
     # --- Augmentation & Transforms ---
     if use_light_aug:
@@ -763,15 +794,17 @@ def train_teacher(
         labels_b = torch.tensor(labels_b, dtype=torch.long)
         return volumes, labels_b
 
-    # --- WeightedRandomSampler ---
-    class_count = np.array([(train_labels == 0).sum(), (train_labels == 1).sum()], dtype=float)
-    w_per_class = 1.0 / np.maximum(class_count, 1.0)
-    sample_w = np.array([w_per_class[int(l)] for l in train_labels], dtype=float)
-    sampler = WeightedRandomSampler(
-        torch.as_tensor(sample_w, dtype=torch.double),
-        num_samples=len(sample_w),
-        replacement=True
-    )
+    # --- WeightedRandomSampler (optional) ---
+    sampler = None
+    if use_weighted_sampler:
+        class_count = np.array([(train_labels == 0).sum(), (train_labels == 1).sum()], dtype=float)
+        w_per_class = 1.0 / np.maximum(class_count, 1.0)
+        sample_w = np.array([w_per_class[int(l)] for l in train_labels], dtype=float)
+        sampler = WeightedRandomSampler(
+            torch.as_tensor(sample_w, dtype=torch.double),
+            num_samples=len(sample_w),
+            replacement=True
+        )
 
     def _seed_worker(worker_id: int):
         worker_seed = seed + worker_id
@@ -784,7 +817,7 @@ def train_teacher(
         train_ds,
         batch_size=batch_size,
         sampler=sampler,
-        shuffle=False,
+        shuffle=(sampler is None),
         num_workers=workers,
         pin_memory=pin_mem,
         collate_fn=collate_fn,
@@ -1074,6 +1107,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--use-light-aug', action='store_true', default=False)
     parser.add_argument('--use-pos-weight', action='store_true', default=False)
+    parser.add_argument('--use-weighted-sampler', action='store_true', default=False,
+                        help='Enable WeightedRandomSampler for class imbalance.')
 
     parser.add_argument('--arch', type=str, default='resnet50', choices=['resnet18','resnet34','resnet50'])
     parser.add_argument('--in-channels', type=int, default=2)
@@ -1088,6 +1123,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--target-spacing', type=float, nargs=3, default=[1.5, 1.0, 1.0])
     parser.add_argument('--hu-min', type=float, default=-100.0)
     parser.add_argument('--hu-max', type=float, default=200.0)
+    parser.add_argument('--no-window-adaptive', action='store_true', default=False,
+                        help='Disable adaptive windowing (use fixed HU window).')
+    parser.add_argument('--no-channel-normalize', action='store_true', default=False,
+                        help='Disable channel normalization (use mean=0/std=1).')
+    parser.add_argument('--dump-window-stats', type=str, default=None,
+                        help='Write per-sample window stats CSV before training.')
+    parser.add_argument('--dump-window-hists', type=str, default=None,
+                        help='Directory to save per-sample post-window histograms (.npz).')
+    parser.add_argument('--window-hist-bins', type=int, default=128,
+                        help='Histogram bins for --dump-window-hists.')
 
     # --- Pretrain Args ---
     parser.add_argument('--pretrain-path', type=str, default=None, help='Path to .pth file')
@@ -1148,7 +1193,13 @@ def main(argv: List[str] | None = None) -> None:
                 target_size=tuple(args.target_size),
                 target_spacing=tuple(args.target_spacing),
                 hu_window=(args.hu_min, args.hu_max),
+                window_adaptive=(not args.no_window_adaptive),
                 pretrain_path=args.pretrain_path,
+                use_channel_normalize=(not args.no_channel_normalize),
+                use_weighted_sampler=args.use_weighted_sampler,
+                dump_window_stats=args.dump_window_stats,
+                dump_window_hists=args.dump_window_hists,
+                window_hist_bins=args.window_hist_bins,
                 train_head_only=args.train_head_only,  # [NEW]
             )
             if 'last_auc' not in m:
