@@ -663,8 +663,8 @@ def train_teacher(
     margin_mm: float = 6,
     target_size: Tuple[int, int, int] = (112, 144, 144),
     target_spacing: Tuple[float, float, float] = (1.5, 1.0, 1.0),
-    hu_window: Tuple[float, float] = (-200.0, 250.0),
-    window_adaptive: bool = True,
+    hu_window: Tuple[float, float] = (-200.0, 300.0),
+    window_adaptive: bool = False,
     # --- Pretrain Args ---
     pretrain_path: str | None = None,
     use_channel_normalize: bool = True,
@@ -1121,9 +1121,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--margin', type=float, default=0)
     parser.add_argument('--target-size', type=int, nargs=3, default=[112, 144, 144])
     parser.add_argument('--target-spacing', type=float, nargs=3, default=[1.5, 1.0, 1.0])
-    parser.add_argument('--hu-min', type=float, default=-100.0)
-    parser.add_argument('--hu-max', type=float, default=200.0)
-    parser.add_argument('--no-window-adaptive', action='store_true', default=False,
+    parser.add_argument('--hu-min', type=float, default=-200.0)
+    parser.add_argument('--hu-max', type=float, default=300.0)
+    parser.add_argument('--no-window-adaptive', action='store_true', default=True,
                         help='Disable adaptive windowing (use fixed HU window).')
     parser.add_argument('--no-channel-normalize', action='store_true', default=False,
                         help='Disable channel normalization (use mean=0/std=1).')

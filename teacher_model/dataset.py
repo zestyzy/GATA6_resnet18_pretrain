@@ -19,10 +19,14 @@ from torch.utils.data import Dataset
 def _load_nifti_with_spacing(path: str) -> Tuple[np.ndarray, Tuple[float, float, float]]:
     """
     Load a NIfTI file and return (data, spacing_mm).
-    
+
     [CRITICAL FIXES]:
     1. Force convert to canonical orientation (RAS+) to ensure Image and Mask alignment.
     2. Transpose data from (W, H, D) to (D, H, W) for PyTorch processing.
+
+    NOTE:
+    This function loads a *single* NIfTI. For strict Image/Mask alignment, see
+    _load_nifti_pair_aligned() which resamples mask onto image grid if needed.
     """
     try:
         import nibabel as nib
@@ -30,17 +34,17 @@ def _load_nifti_with_spacing(path: str) -> Tuple[np.ndarray, Tuple[float, float,
         raise ImportError(
             "nibabel is required. Please install with: pip install nibabel"
         ) from e
-    
+
     img = nib.load(path)
-    
+
     # --- [Fix 1] 强制转换为标准物理方向 (RAS+)，解决 Mask 翻转/错位问题 ---
     img = nib.as_closest_canonical(img)
-    
+
     data = img.get_fdata().astype(np.float32)
-    
+
     # nibabel header zooms are usually (dx, dy, dz) matching the (W, H, D) raw data
     zooms = img.header.get_zooms()[:3]
-    
+
     # --- [Fix 2] 维度转置: (W, H, D) -> (D, H, W) ---
     # PyTorch 3D layers expect (Depth, Height, Width) -> (z, y, x)
     if data.ndim == 3:
@@ -53,8 +57,70 @@ def _load_nifti_with_spacing(path: str) -> Tuple[np.ndarray, Tuple[float, float,
 
     return data, spacing
 
+
+def _load_nifti_pair_aligned(
+    img_path: str, mask_path: str
+) -> Tuple[np.ndarray, np.ndarray, Tuple[float, float, float]]:
+    """
+    [RISK-1 FIX] Load (image, mask) and GUARANTEE they are on the same voxel grid
+    before any numpy-level resampling/cropping.
+
+    Why this matters:
+    - nib.as_closest_canonical() makes each volume "RAS-ish", but does NOT guarantee
+      both volumes share identical affine/shape/grid.
+    - If mask and image have different affine/shape (common in clinical exports),
+      doing independent canonicalization + get_fdata() can still produce misalignment.
+
+    Fix:
+    - Load both as nib images
+    - Canonicalize both
+    - If (shape, affine) mismatch, resample mask onto image grid (nearest neighbor)
+    - Then convert to numpy and transpose to (D,H,W)
+    """
+    try:
+        import nibabel as nib
+        from nibabel.processing import resample_from_to
+    except ImportError as e:
+        raise ImportError(
+            "nibabel is required. Please install with: pip install nibabel"
+        ) from e
+
+    img_nii = nib.load(img_path)
+    msk_nii = nib.load(mask_path)
+
+    # Canonicalize both first
+    img_nii = nib.as_closest_canonical(img_nii)
+    msk_nii = nib.as_closest_canonical(msk_nii)
+
+    # Ensure mask lives on the same grid as image
+    same_shape = (msk_nii.shape[:3] == img_nii.shape[:3])
+    try:
+        same_affine = np.allclose(msk_nii.affine, img_nii.affine, atol=1e-5)
+    except Exception:
+        same_affine = False
+
+    if not (same_shape and same_affine):
+        # order=0 => nearest neighbor for labels
+        msk_nii = resample_from_to(msk_nii, img_nii, order=0)
+
+    img_np = img_nii.get_fdata().astype(np.float32)
+    msk_np = msk_nii.get_fdata().astype(np.float32)
+
+    zooms = img_nii.header.get_zooms()[:3]  # (dx, dy, dz) in nib's (W,H,D) convention
+
+    # transpose (W,H,D)->(D,H,W)
+    if img_np.ndim == 3:
+        img_np = img_np.transpose(2, 1, 0)
+    if msk_np.ndim == 3:
+        msk_np = msk_np.transpose(2, 1, 0)
+
+    spacing = (float(zooms[2]), float(zooms[1]), float(zooms[0]))  # (dz,dy,dx)
+    return img_np, msk_np, spacing
+
+
 def _round_int(x: float) -> int:
     return int(round(float(x)))
+
 
 def _spacing_to_new_size(
     in_shape: Tuple[int, int, int],
@@ -71,6 +137,7 @@ def _spacing_to_new_size(
     new_H = _round_int(Dy * (sy_in / sy_out))
     new_W = _round_int(Dx * (sx_in / sx_out))
     return max(1, new_D), max(1, new_H), max(1, new_W)
+
 
 def _resample3d_torch(
     vol_np: np.ndarray,
@@ -89,6 +156,7 @@ def _resample3d_torch(
     # (1,1,D,H,W) -> (D,H,W)
     return out.squeeze(0).squeeze(0).cpu().numpy()
 
+
 # -------------------------
 # 2. Geometry / BBox Helpers
 # -------------------------
@@ -101,11 +169,12 @@ def compute_bounding_box(mask: np.ndarray) -> Tuple[slice, slice, slice]:
     if coords.size == 0:
         D, H, W = mask.shape
         return slice(0, D), slice(0, H), slice(0, W)
-    
+
     zmin, ymin, xmin = coords.min(axis=0)
     zmax, ymax, xmax = coords.max(axis=0)
     # +1 because slice stop is exclusive
     return slice(zmin, zmax + 1), slice(ymin, ymax + 1), slice(xmin, xmax + 1)
+
 
 def expand_bounding_box_vox(
     slices: Tuple[slice, slice, slice],
@@ -118,16 +187,17 @@ def expand_bounding_box_vox(
     (z_sl, y_sl, x_sl) = slices
     mz, my, mx = margin_vox
     D, H, W = volume_shape
-    
+
     z0 = max(0, (z_sl.start or 0) - mz)
     y0 = max(0, (y_sl.start or 0) - my)
     x0 = max(0, (x_sl.start or 0) - mx)
-    
+
     z1 = min(D, (z_sl.stop or D) + mz)
     y1 = min(H, (y_sl.stop or H) + my)
     x1 = min(W, (x_sl.stop or W) + mx)
-    
+
     return slice(z0, z1), slice(y0, y1), slice(x0, x1)
+
 
 # -------------------------
 # 3. Intensity Helpers
@@ -140,6 +210,7 @@ def _normalize_hu_to_m11(x: np.ndarray, hu_min: float, hu_max: float) -> np.ndar
     denom = max(hu_max - hu_min, 1e-6)
     x = 2.0 * (x - hu_min) / denom - 1.0
     return x.astype(np.float32)
+
 
 # -------------------------
 # 4. Augmentation & Transform
@@ -168,12 +239,12 @@ class LightAugment3D:
         self.p_gamma = float(p_gamma)
         self.p_contrast = float(p_contrast)
         self.p_noise = float(p_noise)
-        
+
         self.max_rotate_deg = float(max_rotate_deg)
         self.max_gamma_delta = float(max_gamma_delta)
         self.max_contrast_delta = float(max_contrast_delta)
         self.max_noise_std = float(max_noise_std)
-        
+
         self.padding_mode = padding_mode
         self.intensity_channels = int(max(0, intensity_channels))
 
@@ -221,10 +292,10 @@ class LightAugment3D:
     def __call__(self, vol: torch.Tensor) -> torch.Tensor:
         if vol.ndim != 4:
             raise ValueError(f"Expected (C,D,H,W) tensor, got {tuple(vol.shape)}")
-        
+
         # Geometric transforms (apply to ALL channels including mask)
         if self._maybe(self.p_flip):
-            vol = vol.flip(-1) # Flip width
+            vol = vol.flip(-1)  # Flip width
         if self._maybe(self.p_rotate):
             deg = random.uniform(-self.max_rotate_deg, self.max_rotate_deg)
             vol = self._rotate_inplane(vol, deg)
@@ -233,7 +304,7 @@ class LightAugment3D:
         if self.intensity_channels > 0:
             ch = min(self.intensity_channels, vol.size(0))
             intensity = vol[:ch]
-            
+
             # [关键] 噪声注入：防止模型过拟合 NCCT 的微观噪声纹理
             if self._maybe(self.p_noise):
                 intensity = self._gaussian_noise(intensity, self.max_noise_std)
@@ -242,13 +313,14 @@ class LightAugment3D:
                 intensity = self._gamma_jitter(intensity, self.max_gamma_delta)
             if self._maybe(self.p_contrast):
                 intensity = self._contrast_jitter(intensity, self.max_contrast_delta)
-            
+
             if ch == vol.size(0):
                 vol = intensity
             else:
                 # 重新拼回 Mask
                 vol = torch.cat([intensity, vol[ch:]], dim=0)
         return vol
+
 
 class Compose3D:
     def __init__(self, transforms: Sequence[Optional[Callable]]):
@@ -258,6 +330,7 @@ class Compose3D:
         for t in self.transforms:
             vol = t(vol)
         return vol
+
 
 class ChannelNormalize:
     def __init__(self, mean, std, channels=None, eps=1e-6):
@@ -274,15 +347,18 @@ class ChannelNormalize:
                 vol[ch] = (vol[ch] - mean[ch]) / std[ch]
         return vol
 
+
 # -------------------------
 # 5. Helpers for File Discovery
 # -------------------------
 def _find_case_dir_by_prefix(root_dir: Path, case_id: str) -> Optional[Path]:
-    if not case_id: return None
+    if not case_id:
+        return None
     for p in sorted(root_dir.iterdir()):
         if p.is_dir() and p.name.startswith(str(case_id)):
             return p
     return None
+
 
 def _find_nifti_pair(case_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
     img, msk = None, None
@@ -295,6 +371,7 @@ def _find_nifti_pair(case_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
         elif ("label" in n) or ("mask" in n):
             msk = p
     return img, msk
+
 
 # -------------------------
 # 6. Main Dataset Class
@@ -327,7 +404,7 @@ class NiftiDataset(Dataset):
         self.transform = transform
         self.include_mask_channel = include_mask_channel
         self.window_adaptive = window_adaptive
-        
+
         # Safe percentile sorting
         p0, p1 = window_percentiles
         self.window_percentiles = (min(p0, p1), max(p0, p1))
@@ -337,23 +414,33 @@ class NiftiDataset(Dataset):
         # Clean columns (remove BOM, strip spaces)
         clean_cols = {c: str(c).strip().lstrip("\ufeff") for c in self.df.columns}
         self.df = self.df.rename(columns=clean_cols)
-        
+
         # Identify columns
         lower_cols = {c.lower(): c for c in self.df.columns}
-        
+
         # Case ID
         id_col = None
         for k in ["case_id", "case"]:
-            if k in self.df.columns: id_col = k; break
-            if k in lower_cols: id_col = lower_cols[k]; break
-        if not id_col: raise KeyError("CSV missing 'case_id' column")
+            if k in self.df.columns:
+                id_col = k
+                break
+            if k in lower_cols:
+                id_col = lower_cols[k]
+                break
+        if not id_col:
+            raise KeyError("CSV missing 'case_id' column")
 
         # Label
         lbl_col = None
         for k in ["label"]:
-            if k in self.df.columns: lbl_col = k; break
-            if k in lower_cols: lbl_col = lower_cols[k]; break
-        if not lbl_col: raise KeyError("CSV missing 'label' column")
+            if k in self.df.columns:
+                lbl_col = k
+                break
+            if k in lower_cols:
+                lbl_col = lower_cols[k]
+                break
+        if not lbl_col:
+            raise KeyError("CSV missing 'label' column")
 
         img_col = lower_cols.get("image_path")
         msk_col = lower_cols.get("mask_path")
@@ -363,7 +450,7 @@ class NiftiDataset(Dataset):
         for _, row in self.df.iterrows():
             cid = str(row[id_col]).strip()
             lbl = int(row[lbl_col])
-            
+
             # Path discovery: CSV absolute paths > Folder search
             i_p, m_p = None, None
             if img_col and msk_col:
@@ -375,7 +462,7 @@ class NiftiDataset(Dataset):
                     p1, p2 = _find_nifti_pair(c_dir)
                     if p1 and p2:
                         i_p, m_p = str(p1), str(p2)
-            
+
             if i_p and m_p and os.path.exists(i_p) and os.path.exists(m_p):
                 self.samples.append((cid, i_p, m_p, lbl))
             else:
@@ -395,24 +482,24 @@ class NiftiDataset(Dataset):
         msk_roi = (msk_roi > 0).astype(np.float32)
 
         # 5. Final Resize to Fixed Tensor Shape (Interpolate)
-        #    This effectively "zooms" the cropped ROI to fill the target volume.
-        img_t = torch.from_numpy(img_roi).unsqueeze(0).unsqueeze(0) # (1,1,D,H,W)
-        img_t = F.interpolate(img_t, size=self.target_size, mode="trilinear", align_corners=False).squeeze(0) # (1,D,H,W)
+        #     This effectively "zooms" the cropped ROI to fill the target volume.
+        img_t = torch.from_numpy(img_roi).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
+        img_t = F.interpolate(img_t, size=self.target_size, mode="trilinear", align_corners=False).squeeze(0)  # (1,D,H,W)
 
         if self.include_mask_channel:
             msk_t = torch.from_numpy(msk_roi).unsqueeze(0).unsqueeze(0)
             msk_t = F.interpolate(msk_t, size=self.target_size, mode="nearest").squeeze(0)
             # Concatenate: Channel 0 = Image, Channel 1 = Mask
-            vol = torch.cat([img_t, msk_t], dim=0) # (2,D,H,W)
+            vol = torch.cat([img_t, msk_t], dim=0)  # (2,D,H,W)
         else:
             vol = img_t
 
         return vol
 
     def _prepare_roi(self, img_path: str, mask_path: str) -> Tuple[np.ndarray, np.ndarray]:
-        # 1. Load Data & Spacing (Align orientation)
-        img_np, spacing_in = _load_nifti_with_spacing(img_path)
-        msk_np, _ = _load_nifti_with_spacing(mask_path)
+        # 1. Load Data & Spacing (Align orientation + STRICT pair alignment)
+        #    [RISK-1 FIX] use pair-aligned loader so mask is resampled onto image grid if needed
+        img_np, msk_np, spacing_in = _load_nifti_pair_aligned(img_path, mask_path)
 
         # 2. Resample to Target Physical Spacing (e.g. 1.5mm)
         #    Crucial so that 'margin_mm' means the same physical distance for everyone.
